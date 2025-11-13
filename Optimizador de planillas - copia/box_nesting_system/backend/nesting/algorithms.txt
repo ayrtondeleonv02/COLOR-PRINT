@@ -1,0 +1,388 @@
+"""
+Advanced nesting algorithms for optimal box layout.
+"""
+
+import math
+import logging
+from typing import Tuple, Optional, Dict, Any, List
+
+from backend.geometry.polygons import OrthoPoly
+from backend.geometry.render_helpers import build_tile_orthopoly_and_edges_cm  # CORREGIDO
+from backend.geometry.transformations import rotate_and_align_top_left, rotate_rect_generic
+from backend.geometry.collision import polygons_intersect
+from backend.geometry.types import Point, RectCM, BoundingBox, NestingResult
+from .cache import NestingCache
+from backend.utils.constants import SCALE_INT
+
+
+class NestingAlgorithms:
+    """
+    Advanced nesting algorithms for box layout optimization.
+    
+    Implements sophisticated algorithms for tile positioning and pattern generation.
+    """
+    
+    def __init__(self):
+        """Initialize nesting algorithms with default parameters."""
+        self.logger = logging.getLogger(__name__)
+
+    def _search_domain_without_bed(self, poly1: OrthoPoly, w2: float, h2: float) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+        """
+        Calculate search domain for tile placement without bed constraints.
+        
+        Args:
+            poly1: First polygon
+            w2: Width of second polygon
+            h2: Height of second polygon
+            
+        Returns:
+            Tuple of ((x_min, x_max), (y_min, y_max))
+        """
+        minx1, miny1, maxx1, maxy1 = poly1.aabb()
+        w1 = maxx1 - minx1
+        h1 = maxy1 - miny1
+        x_min = 0.5 * w1
+        x_max = 2.0 * w1
+        y_min, y_max = -h2, h1
+        return (x_min, x_max), (y_min, y_max)
+
+    def _make_template_for_orientation(self, base_poly: OrthoPoly, base_rects: List[Tuple[str, RectCM]], rot: int) -> Tuple[OrthoPoly, List[Tuple[str, RectCM]], float, float]:
+        """
+        Create template for specific orientation.
+        
+        Args:
+            base_poly: Base polygon
+            base_rects: Base rectangles
+            rot: Rotation angle (0 or 180)
+            
+        Returns:
+            Tuple of (rotated_poly, rotated_rects, width, height)
+            
+        Raises:
+            ValueError: If rotation is not 0 or 180
+        """
+        if rot not in (0, 180):
+            raise ValueError("Rotation must be 0 or 180 degrees")
+            
+        if rot == 0:
+            poly_t = OrthoPoly(base_poly.outer[:], [h[:] for h in base_poly.holes])
+            rects_t = [(n, (x, y, w, h)) for (n, (x, y, w, h)) in base_rects]
+        else:
+            poly_t = base_poly.rotated_copy(180)
+            minx, miny, maxx, maxy = poly_t.aabb()
+            poly_t.translate(-minx, -miny)
+            rects_t: List[Tuple[str, RectCM]] = []
+            for name, (x, y, w, h) in base_rects:
+                rr = rotate_rect_generic((x, y, w, h), 180)
+                rects_t.append((name, (rr[0] - minx, rr[1] - miny, rr[2], rr[3])))
+                
+        minx, miny, maxx, maxy = poly_t.aabb()
+        return poly_t, rects_t, (maxx - minx), (maxy - miny)
+
+    def best_place_second_tile(self, poly1: OrthoPoly, rects1: List[Tuple[str, RectCM]],
+                              paso_y: float = 0.5, paso_x: float = 0.1,
+                              clearance_cm: float = 0.0,
+                              objective: str = "width") -> Optional[NestingResult]:
+        """
+        Find optimal position for second tile relative to first tile.
+        
+        Args:
+            poly1: First polygon
+            rects1: First polygon rectangles
+            paso_y: Y search step
+            paso_x: X search step
+            clearance_cm: Minimum clearance
+            objective: Optimization objective ("width", "height", "area")
+            
+        Returns:
+            Nesting result or None if no valid placement found
+        """
+        eps = 1e-9
+        minx1, miny1, maxx1, maxy1 = poly1.aabb()
+        h1 = maxy1 - miny1
+        max_global_height = 1.2 * h1
+
+        best = None
+        best_key = (float("inf"), float("inf"), float("inf"))
+
+        for rot2 in (0, 180):
+            polyT, rectsT, w2, h2 = self._make_template_for_orientation(poly1, rects1, rot2)
+            (x_min, x_max), (y_min, y_max) = self._search_domain_without_bed(poly1, w2, h2)
+
+            y = y_min
+            while y <= y_max + 1e-9:
+                x = x_min
+                while x <= x_max + 1e-9:
+                    poly2 = OrthoPoly(polyT.outer[:], [h[:] for h in polyT.holes])
+                    poly2.translate(x, y)
+
+                    if polygons_intersect(poly1, poly2, clearance_cm=clearance_cm):
+                        x += paso_x
+                        continue
+
+                    minx2, miny2, maxx2, maxy2 = poly2.aabb()
+                    
+                    if objective == "width":
+                        overlap_y = min(maxy1, maxy2) - max(miny1, miny2)
+                        if overlap_y <= eps:
+                            x += paso_x
+                            continue
+
+                    gminx = min(minx1, minx2)
+                    gminy = min(miny1, miny2)
+                    gmaxx = max(maxx1, maxx2)
+                    gmaxy = max(maxy1, maxy2)
+                    gwidth = (gmaxx - gminx)
+                    gheight = (gmaxy - gminy)
+                    garea = gwidth * gheight
+
+                    if objective == "width" and gheight > max_global_height + eps:
+                        x += paso_x
+                        continue
+                    if objective == "height":
+                        width_limit = 1.5 * (maxx1 - minx1)
+                        if gwidth < width_limit - eps:
+                            x += paso_x
+                            continue
+
+                    if objective == "width":
+                        key = (gwidth, gheight, garea)
+                    elif objective == "height":
+                        key = (gheight, gwidth, garea)
+                    else:
+                        key = (garea, gwidth, gheight)
+
+                    better = False
+                    if key[0] < best_key[0] - eps:
+                        better = True
+                    elif abs(key[0] - best_key[0]) <= eps:
+                        if key[1] < best_key[1] - eps:
+                            better = True
+                        elif abs(key[1] - best_key[1]) <= eps:
+                            if key[2] < best_key[2] - eps:
+                                better = True
+
+                    if better:
+                        best_key = key
+                        best = (x, y, rot2, rectsT, polyT, gwidth, gheight, garea)
+                    x += paso_x
+                y += paso_y
+
+        return best
+
+    def best_place_third_tile(self, poly1: OrthoPoly, poly2: OrthoPoly, 
+                            rects1: List[Tuple[str, RectCM]], rects2: List[Tuple[str, RectCM]],
+                            rot1: int,
+                            paso_y: float = 0.5, paso_x: float = 0.1,
+                            clearance_cm: float = 0.0,
+                            objective: str = "width",
+                            params: Any = None) -> Optional[Tuple[float, float, List[Tuple[str, RectCM]], OrthoPoly, float, float, float]]:
+        """
+        Find optimal position for third tile relative to first two tiles.
+        
+        Args:
+            poly1: First polygon
+            poly2: Second polygon
+            rects1: First polygon rectangles
+            rects2: Second polygon rectangles
+            rot1: First polygon rotation
+            paso_y: Y search step
+            paso_x: X search step
+            clearance_cm: Minimum clearance
+            objective: Optimization objective
+            params: Box parameters (nuevo parámetro)
+            
+        Returns:
+            Third tile placement result or None
+        """
+        eps = 1e-9
+        minx1, miny1, maxx1, maxy1 = poly1.aabb()
+        minx2, miny2, maxx2, maxy2 = poly2.aabb()
+        
+        gminx12 = min(minx1, minx2)
+        gminy12 = min(miny1, miny2)
+        gmaxx12 = max(maxx1, maxx2)
+        gmaxy12 = max(maxy1, maxy2)
+        
+        h1 = maxy1 - miny1
+        max_global_height = 1.2 * h1
+
+        best = None
+        best_key = (float("inf"), float("inf"), float("inf"))
+
+        # Usar parámetros proporcionados
+        if params is None:
+            from backend.models.parameters import PlanoParams
+            params = PlanoParams()
+        
+        poly_base, rects_base = build_tile_orthopoly_and_edges_cm(params)
+        poly_base_rotated, rects_base_rotated = rotate_and_align_top_left(poly_base, rects_base, rot=rot1)
+        
+        poly3T, rects3T = poly_base_rotated, rects_base_rotated
+        
+        minx3T, miny3T, maxx3T, maxy3T = poly3T.aabb()
+        w3 = maxx3T - minx3T
+        h3 = maxy3T - miny3T
+        
+        (x_min, x_max), (y_min, y_max) = self._search_domain_without_bed(poly2, w3, h3)
+        x_min = max(1.5 * (maxx1 - minx1), maxx2 - minx2)
+        x_max = 3.0 * (maxx1 - minx1)
+        
+        y = y_min
+        while y <= y_max + 1e-9:
+            x = x_min
+            while x <= x_max + 1e-9:
+                poly3 = OrthoPoly(poly3T.outer[:], [h[:] for h in poly3T.holes])
+                poly3.translate(x, y)
+
+                collision1 = polygons_intersect(poly1, poly3, clearance_cm=clearance_cm)
+                collision2 = polygons_intersect(poly2, poly3, clearance_cm=clearance_cm)
+                
+                if not collision1 and not collision2:
+                    minx3, miny3, maxx3, maxy3 = poly3.aabb()
+                    
+                    gminx = min(gminx12, minx3)
+                    gminy = min(gminy12, miny3)
+                    gmaxx = max(gmaxx12, maxx3)
+                    gmaxy = max(gmaxy12, maxy3)
+                    
+                    gwidth = gmaxx - gminx
+                    gheight = gmaxy - gminy
+                    garea = gwidth * gheight
+
+                    if objective == "width":
+                        overlap_y = min(gmaxy12, maxy3) - max(gminy12, miny3)
+                        if overlap_y <= eps or gheight > max_global_height + eps:
+                            x += paso_x
+                            continue
+                    if objective == "height":
+                        width_limit = 1.5 * (maxx1 - minx1)
+                        if gwidth < width_limit - eps:
+                            x += paso_x
+                            continue
+
+                    if objective == "width":
+                        key = (gwidth, gheight, garea)
+                    elif objective == "height":
+                        key = (gheight, gwidth, garea)
+                    else:
+                        key = (garea, gwidth, gheight)
+
+                    better = False
+                    if key[0] < best_key[0] - eps:
+                        better = True
+                    elif abs(key[0] - best_key[0]) <= eps:
+                        if key[1] < best_key[1] - eps:
+                            better = True
+                        elif abs(key[1] - best_key[1]) <= eps:
+                            if key[2] < best_key[2] - eps:
+                                better = True
+
+                    if better:
+                        best_key = key
+                        best = (x, y, rects3T, poly3T, gwidth, gheight, garea)
+                
+                x += paso_x
+            y += paso_y
+
+        return best
+
+    def calculate_optimal_nesting(self, params, **kwargs) -> Dict[str, Any]:
+        """
+        Calculate optimal nesting pattern for given parameters.
+        
+        Args:
+            params: Box parameters
+            **kwargs: Nesting parameters
+            
+        Returns:
+            Dictionary with nesting results
+        """
+        self.logger.info("Calculating optimal nesting pattern")
+        
+        # This would implement the full nesting algorithm
+        # For now, return placeholder structure
+        return {
+            'success': True,
+            'tiles_x': kwargs.get('tiles_x', 1),
+            'tiles_y': kwargs.get('tiles_y', 1),
+            'bounding_box': (0, 0, 100, 100),
+            'area': 10000.0,
+            'efficiency': 0.85
+        }
+
+# Añadir esta clase al final de NestingAlgorithms
+def best_place_second_tile(self, poly1: OrthoPoly, rects1: List[Tuple[str, RectCM]],
+                          paso_y: float = 0.5, paso_x: float = 0.1,
+                          clearance_cm: float = 0.0,
+                          objective: str = "width"):
+    """
+    Réplica exacta de _best_place_right_min_bbox del código original.
+    """
+    eps = 1e-9
+    minx1, miny1, maxx1, maxy1 = poly1.aabb()
+    h1 = maxy1 - miny1
+    max_global_height = 1.3 * h1
+
+    best = None
+    best_key = (float("inf"), float("inf"), float("inf"))
+
+    for rot2 in (0, 180):
+        polyT, rectsT, w2, h2 = self._make_template_for_orientation(poly1, rects1, rot2)
+        (x_min, x_max), (y_min, y_max) = self._search_domain_without_bed(poly1, w2, h2)
+
+        y = y_min
+        while y <= y_max + 1e-9:
+            x = x_min
+            while x <= x_max + 1e-9:
+                poly2 = OrthoPoly(polyT.outer[:], [h[:] for h in polyT.holes])
+                poly2.translate(x, y)
+
+                if polygons_intersect(poly1, poly2, clearance_cm=clearance_cm):
+                    x += paso_x
+                    continue
+
+                minx2, miny2, maxx2, maxy2 = poly2.aabb()
+                
+                if objective == "width":
+                    overlap_y = min(maxy1, maxy2) - max(miny1, miny2)
+                    if overlap_y <= eps:
+                        x += paso_x
+                        continue
+
+                gminx = min(minx1, minx2)
+                gminy = min(miny1, miny2)
+                gmaxx = max(maxx1, maxx2)
+                gmaxy = max(maxy1, maxy2)
+                gwidth = (gmaxx - gminx)
+                gheight = (gmaxy - gminy)
+                garea = gwidth * gheight
+
+                if objective == "width" and gheight > max_global_height + eps:
+                    x += paso_x
+                    continue
+
+                if objective == "width":
+                    key = (gwidth, gheight, garea)
+                elif objective == "height":
+                    key = (gheight, gwidth, garea)
+                else:
+                    key = (garea, gwidth, gheight)
+
+                better = False
+                if key[0] < best_key[0] - eps:
+                    better = True
+                elif abs(key[0] - best_key[0]) <= eps:
+                    if key[1] < best_key[1] - eps:
+                        better = True
+                    elif abs(key[1] - best_key[1]) <= eps:
+                        if key[2] < best_key[2] - eps:
+                            better = True
+
+                if better:
+                    best_key = key
+                    best = (x, y, rot2, rectsT, polyT, gwidth, gheight, garea)
+                x += paso_x
+            y += paso_y
+
+    return best
